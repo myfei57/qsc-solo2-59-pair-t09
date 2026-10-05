@@ -100,6 +100,13 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("GET", "/api/warranty/cells", lambda params, body: {"cells": self._platform.warranty_cell_ids()})
+        add("GET", "/api/warranty/cell/{cell_id}", self._warranty_cell)
+        add("GET", "/api/warranty/conclusion/{cell_id}", self._warranty_conclusion)
+        add("GET", "/api/warranty/verify", lambda params, body: self._platform.warranty_verify())
+        add("POST", "/api/warranty/event", self._warranty_event)
+        add("POST", "/api/warranty/maintenance-pack", self._warranty_maintenance_pack)
+        add("POST", "/api/warranty/issue", self._warranty_issue)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +268,60 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _warranty_cell(self, params: dict, body: dict) -> dict:
+        cell_id = str(params.get("cell_id", ""))
+        versions = self._platform.warranty_versions(cell_id)
+        return {"overview": self._platform.warranty_overview(cell_id), "versions": versions}
+
+    def _warranty_conclusion(self, params: dict, body: dict) -> dict:
+        cell_id = str(params.get("cell_id", ""))
+        version = params.get("version")
+        report = self._platform.warranty_get(
+            cell_id, None if version is None else int(version)
+        )
+        return {"report": report, "versions": self._platform.warranty_versions(cell_id)}
+
+    def _warranty_event(self, params: dict, body: dict) -> dict:
+        resume = body.get("expected_resume_at")
+        return {
+            "event": self._platform.warranty_record_event(
+                cell_id=str(body.get("cell_id", "")),
+                kind=str(body.get("kind", "")),
+                at=body.get("at", 0),
+                rack_id=str(body.get("rack_id", "")),
+                evidence=dict(body.get("evidence", {})),
+                recorded_by=str(body.get("recorded_by", "console")),
+                expected_resume_at=None if resume is None else resume,
+                note=str(body.get("note", "")),
+            )
+        }
+
+    def _warranty_maintenance_pack(self, params: dict, body: dict) -> dict:
+        resume = body.get("expected_resume_at")
+        return {
+            "result": self._platform.warranty_record_maintenance_pack(
+                cell_ids=[str(item) for item in body.get("cell_ids", [])],
+                in_at=body.get("in_at", 0),
+                out_at=body.get("out_at", 0),
+                rack_id=str(body.get("rack_id", "")),
+                evidence=dict(body.get("evidence", {})),
+                recorded_by=str(body.get("recorded_by", "console")),
+                expected_resume_at=None if resume is None else resume,
+                note=str(body.get("note", "")),
+            )
+        }
+
+    def _warranty_issue(self, params: dict, body: dict) -> dict:
+        warranty_days = body.get("warranty_days")
+        max_gap_s = body.get("max_gap_s")
+        return self._platform.warranty_issue(
+            cell_id=str(body.get("cell_id", "")),
+            claim_at=body.get("claim_at", 0),
+            claim_ref=str(body.get("claim_ref", "")),
+            issued_by=str(body.get("issued_by", "console")),
+            basis=str(body.get("basis", "")),
+            basis_reason=str(body.get("basis_reason", "")),
+            warranty_days=None if warranty_days is None else float(warranty_days),
+            max_gap_s=None if max_gap_s is None else float(max_gap_s),
+        )

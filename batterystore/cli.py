@@ -22,6 +22,7 @@ from .app import Platform, build_platform
 from .clock import ManualClock, SystemClock
 from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
+from .console.warranty_cli import build_warranty_parser, run_warranty
 from .errors import StoreError
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/racks")
@@ -212,6 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    build_warranty_parser(sub, common)
     return parser
 
 
@@ -224,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
             reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "warranty_command", None):
+        args.platform = lambda: _build(args)
+        return run_warranty(args)
     try:
         return int(args.func(args))
     except StoreError as error:

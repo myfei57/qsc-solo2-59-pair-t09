@@ -39,10 +39,14 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .warranty.service import WarrantyService
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
 DEFAULT_ZONE = "Z1"
+
+# 这些簇级编排动作构成单体的实际运行证据，同步落责任台账。
+WARRANTY_RACK_ACTIONS = ("grid_tie", "charge", "discharge", "balance")
 
 
 def build_rack(rack_id: str, label: str, zone: str, config: StationConfig, packs: int = 8) -> Rack:
@@ -106,6 +110,7 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.warranty = WarrantyService(store, self.clock)
 
         self._cycles = 0
         self._operations = 0
@@ -170,7 +175,7 @@ class Platform:
             raise KeyError(f"未知的簇: {key}")
         return self.racks[key]
 
-    def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
+    def _record_operation(self, op_id: str, operation: str, report: dict, rack_id: str = "") -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
         for step in report.get("steps", []):
@@ -222,6 +227,14 @@ class Platform:
             )
         )
         self._operations += 1
+        if rack_id and operation in WARRANTY_RACK_ACTIONS:
+            # 簇级实际运行动作同步进单体责任台账：单体的运行证据按其当时所在簇归集。
+            self.warranty.record_rack_operation(
+                rack_id=rack_id,
+                op_id=op_id,
+                action=operation,
+                ok=bool(report.get("ok")),
+            )
         self._persist()
         return summary
 
@@ -303,7 +316,7 @@ class Platform:
                 dt=dt,
                 now=self.clock.now(),
             )
-            summary = self._record_operation(op_id, "grid_tie", report)
+            summary = self._record_operation(op_id, "grid_tie", report, DEFAULT_RACK)
             return {**report, **summary}
 
     def transfer_off_grid(self) -> dict:
@@ -319,7 +332,6 @@ class Platform:
                 steps.append({"component": "pcs", "action": "transfer", "detail": self.pcs.transfer("off_grid", "off_grid_request")})
             summary = self._record_operation(op_id, "off_grid", {"ok": not violations, "steps": steps, "violations": violations})
             return {"station": self.station, "ok": not violations, "steps": steps, "violations": violations, **summary}
-
     def discharge(self, power_kw: float = 200.0, dt: float = 60.0) -> dict:
         """放电编排：并网限额钳位 → 爬坡 → 电量累计 → 配额记账。"""
 
@@ -337,7 +349,7 @@ class Platform:
                 dt=dt,
                 now=self.clock.now(),
             )
-            summary = self._record_operation(op_id, "discharge", report)
+            summary = self._record_operation(op_id, "discharge", report, DEFAULT_RACK)
             return {**report, **summary}
 
     def charge(self, rack_id: str | None = None, steps: int = 3, dt: float = 60.0) -> dict:
@@ -360,7 +372,7 @@ class Platform:
                 dt=dt,
                 now=self.clock.now(),
             )
-            summary = self._record_operation(op_id, "charge", report)
+            summary = self._record_operation(op_id, "charge", report, rack.rack_id)
             return {**report, **summary}
 
     def balance(self, rack_id: str | None = None, dt: float = 2.0, max_steps: int = 400) -> dict:
@@ -389,7 +401,7 @@ class Platform:
                 }
             )
             report = {"station": self.station, "ok": not violations, "steps": steps, "violations": violations}
-            summary = self._record_operation(op_id, "balance", report)
+            summary = self._record_operation(op_id, "balance", report, rack.rack_id)
             return {**report, **summary}
 
     def sample_temperature(self, rack_id: str | None = None, temperature_c: float = 30.0, dt: float = 5.0) -> dict:
@@ -659,6 +671,140 @@ class Platform:
         for rack in self.racks.values():
             routed.extend(self.bms.alarm_report(rack, self.mapping, self.config.bms.ready_delta_mv))
         return routed
+
+    def warranty_record_event(
+        self,
+        *,
+        cell_id: str,
+        kind: str,
+        at: float | str | int,
+        rack_id: str = "",
+        evidence: dict,
+        recorded_by: str = "",
+        expected_resume_at: float | str | int | None = None,
+        note: str = "",
+    ) -> dict:
+        """登记一条单体履历节点（交付／并网／检修／流转／退役）。"""
+
+        with self._lock:
+            event = self.warranty.record_event(
+                cell_id=cell_id,
+                kind=kind,
+                at=at,
+                rack_id=rack_id,
+                evidence=evidence,
+                recorded_by=recorded_by,
+                expected_resume_at=expected_resume_at,
+                note=note,
+            )
+            self.bus.publish(
+                Event.of(
+                    "warranty",
+                    "warranty",
+                    f"cell_{kind}",
+                    station=self.station,
+                    severity="notice",
+                    cell_id=cell_id,
+                    rack_id=rack_id,
+                )
+            )
+            return event
+
+    def warranty_record_maintenance_pack(
+        self,
+        *,
+        cell_ids: list[str],
+        in_at: float | str | int,
+        out_at: float | str | int,
+        rack_id: str,
+        evidence: dict,
+        recorded_by: str = "",
+        expected_resume_at: float | str | int | None = None,
+        note: str = "",
+    ) -> dict:
+        """登记整包检修（包内每只单体展开为入厂／复装两条履历）。"""
+
+        with self._lock:
+            return self.warranty.record_maintenance_pack(
+                cell_ids=cell_ids,
+                in_at=in_at,
+                out_at=out_at,
+                rack_id=rack_id,
+                evidence=evidence,
+                recorded_by=recorded_by,
+                expected_resume_at=expected_resume_at,
+                note=note,
+            )
+
+    def warranty_overview(self, cell_id: str) -> dict:
+        """返回单体履历与簇归属预检。"""
+
+        with self._lock:
+            return self.warranty.cell_overview(cell_id)
+
+    def warranty_cell_ids(self) -> list[str]:
+        """返回台账中全部单体标识。"""
+
+        with self._lock:
+            return self.warranty.cell_ids()
+
+    def warranty_issue(
+        self,
+        *,
+        cell_id: str,
+        claim_at: float | str | int,
+        claim_ref: str = "",
+        issued_by: str = "",
+        basis: str = "",
+        basis_reason: str = "",
+        warranty_days: float | None = None,
+        max_gap_s: float | None = None,
+    ) -> dict:
+        """为单体出版一份不可改的责任归属结论（自动接续新版本）。"""
+
+        with self._lock:
+            issued = self.warranty.issue_conclusion(
+                cell_id=cell_id,
+                claim_at=claim_at,
+                claim_ref=claim_ref,
+                station=self.station,
+                issued_by=issued_by,
+                basis=basis,
+                basis_reason=basis_reason,
+                warranty_days=warranty_days,
+                max_gap_s=604800.0 if max_gap_s is None else max_gap_s,
+            )
+            self.bus.publish(
+                Event.of(
+                    "warranty",
+                    "warranty",
+                    "conclusion_issued",
+                    station=self.station,
+                    severity="notice",
+                    cell_id=cell_id,
+                    report_id=issued["index"]["report_id"],
+                    version=issued["index"]["version"],
+                )
+            )
+            return issued
+
+    def warranty_get(self, cell_id: str, version: int | None = None) -> dict:
+        """读取已出版结论（默认最新版本）。"""
+
+        with self._lock:
+            return self.warranty.get_conclusion(cell_id, version)
+
+    def warranty_versions(self, cell_id: str) -> list[dict]:
+        """列出单体的全部出版版本索引。"""
+
+        with self._lock:
+            return self.warranty.list_versions(cell_id)
+
+    def warranty_verify(self) -> dict:
+        """核验责任台账与结论归档的哈希链完整性。"""
+
+        with self._lock:
+            return self.warranty.verify_all()
 
     def readiness(self) -> dict:
         """返回各簇就绪判据与联控链核对结果。"""

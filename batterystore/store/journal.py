@@ -91,6 +91,27 @@ class JsonlJournal:
             records.extend(self._read_file(path))
         return records
 
+    def read_all_indexed(self) -> list[dict]:
+        """读取全部记录并附上全局序号、段号与段内行号（从 0 起）。"""
+
+        indexed: list[dict] = []
+        sequence = 0
+        for segment, path in enumerate(self.segments()):
+            for line_no, record in enumerate(self._read_file(path)):
+                indexed.append({"seq": sequence, "segment": segment, "line": line_no, "record": record})
+                sequence += 1
+        return indexed
+
+    def locate(self, seq: int) -> dict | None:
+        """把全局序号翻译成段号与段内行号，越界返回 ``None``。"""
+
+        if seq < 0:
+            return None
+        segment, line = divmod(seq, self._segment_limit)
+        if segment >= len(self.segments()):
+            return None
+        return {"segment": segment, "line": line, "path": self._segment_path(segment)}
+
     def count(self) -> int:
         """返回累计写入条数。"""
 

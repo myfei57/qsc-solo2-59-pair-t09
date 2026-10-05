@@ -49,3 +49,7 @@ class ConfigError(StoreError):
 
 class NamespaceError(StoreError):
     """命名空间重复注册或解析失败。"""
+
+
+class WarrantyError(StoreError):
+    """单体责任期台账或证据链不合法（动作顺序、字段或防篡改校验失败）。"""

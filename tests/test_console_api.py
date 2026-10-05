@@ -106,6 +106,57 @@ def test_console_actions_and_errors(platform):
         server.stop()
 
 
+def test_console_warranty_claim_flow(platform):
+    support.bring_online(platform)
+    server = ConsoleServer(platform, port=0)
+    base_url = server.start()
+    day = 86400.0
+    try:
+        code, _payload = _post(base_url, "/api/cell/event", {"cell_id": "c-http", "action": "delivered", "ts": 1600000000.0})
+        assert code == 200
+        code, _payload = _post(
+            base_url,
+            "/api/cell/event",
+            {"cell_id": "c-http", "action": "commissioned", "ts": 1600000000.0 + 5 * day, "payload": {"rack_id": "rk-01"}},
+        )
+        assert code == 200
+        code, timeline = _get(base_url, "/api/cell/c-http/timeline")
+        assert code == 200
+        assert timeline["structurally_intact"] is True
+        code, attribution = _get(base_url, "/api/cell/c-http/attribution")
+        assert code == 200
+        assert attribution["selected_basis"] in ("delivery", "grid")
+        code, issued = _post(base_url, "/api/cell/claim", {"cell_id": "c-http", "claim_ts": 1600000000.0 + 10 * day})
+        assert code == 200
+        assert issued["version"] == 1
+        code, claims = _get(base_url, "/api/cell/c-http/claims")
+        assert code == 200
+        assert len(claims["versions"]) == 1
+        code, reviewed = _post(
+            base_url,
+            "/api/cell/claim/review",
+            {"cell_id": "c-http", "reviewer": "inspector", "claim_ts": 1600000000.0 + 20 * day, "note": "复核"},
+        )
+        assert code == 200
+        assert reviewed["version"] == 2
+        code, verification = _get(base_url, "/api/cell/c-http/verify")
+        assert code == 200
+        assert verification["package_chain"]["ok"] is True
+        assert verification["event_chain"]["ok"] is True
+        code, overview = _get(base_url, "/api/warranty")
+        assert code == 200
+        assert overview["claimed_cells"] >= 1
+        try:
+            _post(base_url, "/api/cell/event", {"cell_id": "c-http", "action": "runtime", "payload": {"grid_seconds": 0}})
+        except urllib.error.HTTPError as error:
+            assert error.code == 409
+            assert json.loads(error.read().decode("utf-8"))["component"] == "warranty"
+        else:  # pragma: no cover - 明确失败路径
+            raise AssertionError("非法事件应当返回 409")
+    finally:
+        server.stop()
+
+
 def test_console_rejects_bad_numeric_parameter(platform):
     support.bring_online(platform)
     server = ConsoleServer(platform, port=0)

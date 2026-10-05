@@ -1,6 +1,6 @@
 """命令行入口。
 
-六个子命令覆盖日常使用：
+子命令覆盖日常使用：
 
 ``serve``    启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``     在本地跑一遍完整流程（启动 → 并网切换 → 温度降额 → 均衡 → 充电 →
@@ -8,7 +8,10 @@
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
-``reset``    清掉落盘的平台计数。
+``reset``    清掉落盘的平台计数；
+``cell-event`` 向单体台账追加一条履历事件（交付/投运/停运/复投/搬迁/运行证据）；
+``cell-timeline`` 打印单体证据时间线（含断点与缺段标注）；
+``claim``    为单体签发或复核索赔材料包，或核对材料版本链。
 """
 
 from __future__ import annotations
@@ -171,6 +174,71 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cell_event(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    payload: dict = {}
+    if args.rack:
+        payload["rack_id"] = args.rack
+    if args.to_rack:
+        payload["to_rack"] = args.to_rack
+    if args.reason:
+        payload["reason"] = args.reason
+    if args.grid_seconds is not None:
+        payload["grid_seconds"] = args.grid_seconds
+    if args.charge_kwh is not None:
+        payload["charge_kwh"] = args.charge_kwh
+    if args.discharge_kwh is not None:
+        payload["discharge_kwh"] = args.discharge_kwh
+    _dump(
+        platform.record_cell_event(
+            args.cell_id,
+            args.action,
+            ts=args.ts,
+            payload=payload,
+            source=args.source,
+        )
+    )
+    return 0
+
+
+def _cmd_cell_timeline(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.cell_timeline(args.cell_id, as_of=args.as_of))
+    return 0
+
+
+def _cmd_claim(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.claim_action == "issue":
+        _dump(
+            platform.issue_claim(
+                args.cell_id,
+                claim_ts=args.claim_ts,
+                preferred_basis=args.basis,
+                note=args.note,
+            )
+        )
+    elif args.claim_action == "review":
+        _dump(
+            platform.review_claim(
+                args.cell_id,
+                reviewer=args.reviewer,
+                claim_ts=args.claim_ts,
+                preferred_basis=args.basis,
+                note=args.note,
+            )
+        )
+    elif args.claim_action == "show":
+        latest = platform.latest_claim(args.cell_id)
+        if latest is None:
+            _dump({"cell_id": args.cell_id, "versions": []})
+        else:
+            _dump(latest)
+    else:
+        _dump(platform.verify_claim(args.cell_id))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -212,6 +280,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    cell_event = sub.add_parser("cell-event", help="向单体台账追加一条履历事件", parents=[common])
+    cell_event.add_argument("cell_id", help="单体标识")
+    cell_event.add_argument(
+        "action",
+        choices=("delivered", "commissioned", "decommissioned", "recommissioned", "relocated", "runtime"),
+        help="履历事件类型",
+    )
+    cell_event.add_argument("--ts", type=float, default=None, help="事件时间戳，缺省取当前时间")
+    cell_event.add_argument("--rack", default=None, help="投运/复投/运行证据所在簇")
+    cell_event.add_argument("--to-rack", default=None, help="搬迁迁入簇")
+    cell_event.add_argument("--reason", choices=("maintenance", "relocation"), default=None, help="停运原因")
+    cell_event.add_argument("--grid-seconds", type=float, default=None, help="运行证据并网秒数")
+    cell_event.add_argument("--charge-kwh", type=float, default=None, help="运行证据充电量")
+    cell_event.add_argument("--discharge-kwh", type=float, default=None, help="运行证据放电量")
+    cell_event.add_argument("--source", default="cli", help="证据来源（工单/系统名）")
+    cell_event.set_defaults(func=_cmd_cell_event)
+
+    cell_timeline = sub.add_parser("cell-timeline", help="打印单体证据时间线", parents=[common])
+    cell_timeline.add_argument("cell_id", help="单体标识")
+    cell_timeline.add_argument("--as-of", type=float, default=None, help="截止时间戳")
+    cell_timeline.set_defaults(func=_cmd_cell_timeline)
+
+    claim = sub.add_parser("claim", help="签发/复核/查看/核对单体索赔材料", parents=[common])
+    claim.add_argument("claim_action", choices=("issue", "review", "show", "verify"))
+    claim.add_argument("cell_id", help="单体标识")
+    claim.add_argument("--basis", choices=("delivery", "grid"), default=None, help="指定责任期切法")
+    claim.add_argument("--claim-ts", type=float, default=None, help="索赔时点时间戳")
+    claim.add_argument("--reviewer", default="", help="复核人署名（review 必填）")
+    claim.add_argument("--note", default="", help="签发或复核备注")
+    claim.set_defaults(func=_cmd_claim)
     return parser
 
 

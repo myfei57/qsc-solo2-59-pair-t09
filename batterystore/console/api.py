@@ -77,6 +77,14 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/warranty", lambda params, body: self._platform.warranty_overview())
+        add("GET", "/api/cell/{cell_id}/timeline", self._cell_timeline)
+        add("GET", "/api/cell/{cell_id}/attribution", self._cell_attribution)
+        add("GET", "/api/cell/{cell_id}/claims", self._cell_claims)
+        add("GET", "/api/cell/{cell_id}/verify", lambda params, body: self._platform.verify_claim(str(params.get("cell_id", ""))))
+        add("POST", "/api/cell/event", self._cell_event)
+        add("POST", "/api/cell/claim", self._cell_claim_issue)
+        add("POST", "/api/cell/claim/review", self._cell_claim_review)
         add("GET", "/api/config", lambda params, body: self._platform.config_export())
         add("GET", "/api/pages", lambda params, body: {"pages": self._pages.index(), "routes": self.routes()})
         add("POST", "/api/start", lambda params, body: self._platform.start())
@@ -175,6 +183,56 @@ class Api:
         if segment is not None:
             payload["records"] = self._platform.audit.replay_segment(int(segment))
         return payload
+
+    def _cell_id(self, params: dict, body: dict) -> str:
+        value = params.get("cell_id") or body.get("cell_id")
+        if not value:
+            raise StoreError("必须给出 cell_id", component="console")
+        return str(value)
+
+    def _cell_event(self, params: dict, body: dict) -> dict:
+        return self._platform.record_cell_event(
+            self._cell_id(params, body),
+            action=str(body.get("action", "")),
+            ts=_as_float(body, "ts", self._platform.clock.now()) if "ts" in body else None,
+            payload=dict(body.get("payload", {})) if isinstance(body.get("payload"), dict) else {},
+            source=str(body.get("source", "console")),
+        )
+
+    def _cell_timeline(self, params: dict, body: dict) -> dict:
+        return self._platform.cell_timeline(
+            self._cell_id(params, body),
+            as_of=float(params["as_of"]) if params.get("as_of") else None,
+            gap_threshold_s=float(params["gap_threshold_s"]) if params.get("gap_threshold_s") else None,
+        )
+
+    def _cell_attribution(self, params: dict, body: dict) -> dict:
+        return self._platform.cell_attribution(
+            self._cell_id(params, body),
+            claim_ts=float(params["claim_ts"]) if params.get("claim_ts") else None,
+            preferred_basis=params.get("basis") or None,
+        )
+
+    def _cell_claims(self, params: dict, body: dict) -> dict:
+        cell_id = self._cell_id(params, body)
+        return {"cell_id": cell_id, "versions": self._platform.claim_versions(cell_id)}
+
+    def _cell_claim_issue(self, params: dict, body: dict) -> dict:
+        return self._platform.issue_claim(
+            self._cell_id(params, body),
+            claim_ts=_as_float(body, "claim_ts", self._platform.clock.now()) if "claim_ts" in body else None,
+            preferred_basis=body.get("basis"),
+            note=str(body.get("note", "")),
+        )
+
+    def _cell_claim_review(self, params: dict, body: dict) -> dict:
+        return self._platform.review_claim(
+            self._cell_id(params, body),
+            reviewer=str(body.get("reviewer", "")),
+            claim_ts=_as_float(body, "claim_ts", self._platform.clock.now()) if "claim_ts" in body else None,
+            preferred_basis=body.get("basis"),
+            note=str(body.get("note", "")),
+        )
 
     def _cycle(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(dt=_as_float(body, "dt", 5.0))

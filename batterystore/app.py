@@ -16,7 +16,7 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import StoreError, WarrantyError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
@@ -39,6 +39,10 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .warranty.ledger import CellEventLedger
+from .warranty.liability import DEFAULT_WARRANTY_TERM_S
+from .warranty.registry import ClaimRegistry
+from .warranty.timeline import DEFAULT_GAP_THRESHOLD_S, build_cell_timeline
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
@@ -106,6 +110,10 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.cell_events = CellEventLedger(store.root)
+        self.claims = ClaimRegistry(store.root, self.clock)
+        self.warranty_term_s = float(DEFAULT_WARRANTY_TERM_S)
+        self.evidence_gap_threshold_s = float(DEFAULT_GAP_THRESHOLD_S)
 
         self._cycles = 0
         self._operations = 0
@@ -131,6 +139,7 @@ class Platform:
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
             ("station", "audit", "run-audit"),
+            ("station", "warranty", "claim-evidence"),
         ):
             self.namespaces.register(area, device, kind)
         for rack_id, rack in self.racks.items():
@@ -692,6 +701,190 @@ class Platform:
 
         return self.namespaces.resolve(address)
 
+    # ------------------------------------------------------------------
+    # 单体责任期台账与索赔材料
+    # ------------------------------------------------------------------
+
+    def record_cell_event(
+        self,
+        cell_id: str,
+        action: str,
+        ts: float | None = None,
+        payload: dict | None = None,
+        source: str = "console",
+    ) -> dict:
+        """向某只单体的只追加台账写一条履历事件。
+
+        历史补录（比如事后补检修单）允许显式给 ``ts``，事件时间与追加顺序
+        不一致会在时间线里标成告警，而不是被拒——台账保留真实补录痕迹。
+        """
+
+        from .warranty.events import EVENT_ACTIONS
+
+        if action not in EVENT_ACTIONS:
+            raise WarrantyError(f"未知的单体履历事件类型: {action}", component="warranty")
+        with self._lock:
+            when = self.clock.now() if ts is None else float(ts)
+            event = self.cell_events.record(cell_id, action, when, payload=payload, source=source)
+            self.bus.publish(
+                Event.of(
+                    "warranty",
+                    "warranty",
+                    f"cell_{action}",
+                    station=self.station,
+                    severity="notice",
+                    cell_id=cell_id,
+                    seq=event.seq,
+                    event_ts=event.ts,
+                    source=event.source,
+                )
+            )
+            return event.as_dict()
+
+    def cell_timeline(
+        self,
+        cell_id: str,
+        *,
+        as_of: float | None = None,
+        gap_threshold_s: float | None = None,
+    ) -> dict:
+        """返回某只单体带断点与缺段标注的证据时间线。"""
+
+        threshold = self.evidence_gap_threshold_s if gap_threshold_s is None else float(gap_threshold_s)
+        events = self.cell_events.list_events(cell_id)
+        return build_cell_timeline(events, as_of=as_of, gap_threshold_s=threshold)
+
+    def cell_attribution(
+        self,
+        cell_id: str,
+        *,
+        claim_ts: float | None = None,
+        preferred_basis: str | None = None,
+        as_of: float | None = None,
+        warranty_term_s: float | None = None,
+        gap_threshold_s: float | None = None,
+    ) -> dict:
+        """只算不落盘：预览某只单体的责任期归属结论。"""
+
+        from .warranty.liability import attribute_liability
+
+        effective_claim = self.clock.now() if claim_ts is None else float(claim_ts)
+        timeline = self.cell_timeline(
+            cell_id,
+            as_of=as_of if as_of is not None else effective_claim,
+            gap_threshold_s=gap_threshold_s if gap_threshold_s is not None else self.evidence_gap_threshold_s,
+        )
+        return attribute_liability(
+            timeline,
+            claim_ts=effective_claim,
+            warranty_term_s=self.warranty_term_s if warranty_term_s is None else float(warranty_term_s),
+            preferred_basis=preferred_basis,
+        )
+
+    def issue_claim(
+        self,
+        cell_id: str,
+        *,
+        claim_ts: float | None = None,
+        preferred_basis: str | None = None,
+        note: str = "",
+        warranty_term_s: float | None = None,
+        as_of: float | None = None,
+        gap_threshold_s: float | None = None,
+    ) -> dict:
+        """为某只单体固化第一版"归属结论 + 证据链"材料包。"""
+
+        with self._lock:
+            record = self.claims.issue(
+                cell_id,
+                self.cell_events.list_events(cell_id),
+                claim_ts=self.clock.now() if claim_ts is None else float(claim_ts),
+                warranty_term_s=self.warranty_term_s if warranty_term_s is None else float(warranty_term_s),
+                preferred_basis=preferred_basis,
+                as_of=as_of,
+                gap_threshold_s=self.evidence_gap_threshold_s if gap_threshold_s is None else float(gap_threshold_s),
+                note=note,
+            )
+            self._announce_claim(cell_id, record["version"], "claim_issued")
+            return record
+
+    def review_claim(
+        self,
+        cell_id: str,
+        reviewer: str,
+        *,
+        claim_ts: float | None = None,
+        preferred_basis: str | None = None,
+        note: str = "",
+        warranty_term_s: float | None = None,
+        as_of: float | None = None,
+        gap_threshold_s: float | None = None,
+    ) -> dict:
+        """在已有材料包上追加一版署名复核材料（老版本字节不动）。"""
+
+        with self._lock:
+            record = self.claims.review(
+                cell_id,
+                self.cell_events.list_events(cell_id),
+                claim_ts=self.clock.now() if claim_ts is None else float(claim_ts),
+                warranty_term_s=self.warranty_term_s if warranty_term_s is None else float(warranty_term_s),
+                preferred_basis=preferred_basis,
+                as_of=as_of,
+                gap_threshold_s=self.evidence_gap_threshold_s if gap_threshold_s is None else float(gap_threshold_s),
+                note=note,
+                reviewer=reviewer,
+            )
+            self._announce_claim(cell_id, record["version"], "claim_reviewed")
+            return record
+
+    def claim_versions(self, cell_id: str) -> list[dict]:
+        """返回某只单体材料包的全部版本。"""
+
+        return self.claims.versions(cell_id)
+
+    def latest_claim(self, cell_id: str) -> dict | None:
+        """返回某只单体的最新一版材料包。"""
+
+        return self.claims.latest(cell_id)
+
+    def verify_claim(self, cell_id: str) -> dict:
+        """核对材料包版本链是否被改写或删过，并附台账事件链核对结果。"""
+
+        return {
+            "package_chain": self.claims.verify_chain(cell_id),
+            "event_chain": self.cell_events.verify_cell(cell_id),
+        }
+
+    def warranty_overview(self) -> dict:
+        """返回全部单体台账与材料包的核对概览。"""
+
+        event_cells = self.cell_events.known_cells()
+        claim_cells = self.claims.known_cells()
+        event_checks = self.cell_events.verify_all()
+        claim_checks = [self.claims.verify_chain(cell_id) for cell_id in claim_cells]
+        return {
+            "tracked_cells": len(event_cells),
+            "claimed_cells": len(claim_cells),
+            "event_ledger": event_checks,
+            "claim_packages": claim_checks,
+            "all_intact": all(item["ok"] for item in event_checks) and all(item["ok"] for item in claim_checks),
+            "warranty_term_s": self.warranty_term_s,
+            "gap_threshold_s": self.evidence_gap_threshold_s,
+        }
+
+    def _announce_claim(self, cell_id: str, version: int, action: str) -> None:
+        self.bus.publish(
+            Event.of(
+                "warranty",
+                "warranty",
+                action,
+                station=self.station,
+                severity="notice",
+                cell_id=cell_id,
+                version=version,
+            )
+        )
+
     def capacity(self) -> CapacityPlan:
         """返回站容量核算。"""
 
@@ -778,6 +971,7 @@ class Platform:
             "quota": self.quota_snapshot(),
             "audit": self.audit_snapshot(),
             "mapping": self.rack_mapping(),
+            "warranty": self.warranty_overview(),
             "config": config_to_mapping(self.config),
         }
 
